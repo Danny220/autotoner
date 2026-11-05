@@ -1,0 +1,16 @@
+@import "tailwindcss";
+
+@theme {
+  --color-vintage-dark: #141416;
+  --color-vintage-panel: #1f2023;
+  --color-vintage-tweed: #c29d59;
+  --color-vintage-gold: #d4af37;
+  --color-vintage-silver: #a6a8ab;
+}
+
+body {
+  background-color: #09090b;
+  color: #f4f4f5;
+  font-family: sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
