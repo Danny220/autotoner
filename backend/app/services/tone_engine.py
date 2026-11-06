@@ -1,22 +1,12 @@
-import json
 import logging
 import random
 import time
-from builtins import Exception, range, RuntimeError
-from google import genai
-from google.genai import types
+from google.genai import errors, types
 from app.schemas.tone import SongMatchRequest, TonePresetResponse
+from app.services.gemini_client import get_gemini_client
 from app.core.config import settings
-from pydantic import BaseModel
 
 logger = logging.getLogger("autotoner.tone_engine")
-
-client = genai.Client(api_key=settings.GEMINI_API_KEY)
-
-CANDIDATE_MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.8-flash-lite"
-]
 
 SYSTEM_PROMPT = """You are an elite guitar technician, audio engineer, and gear historian.
 Your mission is to accurately replicate the guitar tone of a specific song using STRICTLY and ONLY the gear that the guitarist owns (their amp, guitar pickups, and available pedals).
@@ -28,7 +18,24 @@ Rules:
 4. Output strict JSON conforming to the schema.
 """
 
+
+def _build_prompt(request: SongMatchRequest) -> str:
+    """Build the prompt describing the target song and user gear profile."""
+    artist_display = request.artist or "Unknown Artist"
+    notes_display = request.additional_notes or "None"
+    rig_json = request.user_rig.model_dump_json(indent=2)
+
+    return (
+        f'Target Song: "{request.song_title}" by {artist_display}\n'
+        f"User Context/Notes: {notes_display}\n\n"
+        f"User Gear Profile:\n{rig_json}\n\n"
+        "Calculate the exact settings to dial in to match this record as closely as possible."
+    )
+
+
 def _execute_generation(model_name: str, prompt: str) -> TonePresetResponse:
+    """Execute content generation with a specific Gemini model."""
+    client = get_gemini_client()
     response = client.models.generate_content(
         model=model_name,
         contents=prompt,
@@ -39,20 +46,23 @@ def _execute_generation(model_name: str, prompt: str) -> TonePresetResponse:
             temperature=0.1,
         ),
     )
+
+    if not response or not response.text:
+        raise RuntimeError(f"Model {model_name} returned an empty response or was filtered.")
+
     return TonePresetResponse.model_validate_json(response.text)
 
-def generate_preset_from_song(request: SongMatchRequest, max_retries_per_model: int = 3) -> TonePresetResponse:
-    prompt = f"""Target Song: "{request.song_title}" by {request.artist or 'Unknown Artist'}
-User Context/Notes: {request.additional_notes or 'None'}
 
-User Gear Profile:
-{request.user_rig.model_dump_json(indent=2)}
-
-Calculate the exact settings to dial in to match this record as closely as possible."""
-
+def generate_preset_from_song(
+    request: SongMatchRequest,
+    max_retries_per_model: int = 3,
+) -> TonePresetResponse:
+    """Generate tone preset from song title and rig profile using a fallback chain of models."""
+    prompt = _build_prompt(request)
+    candidate_models = request.ai_model_chain or list(settings.DEFAULT_AI_MODELS)
     last_error: Exception | None = None
 
-    for model_name in CANDIDATE_MODELS:
+    for model_name in candidate_models:
         for attempt in range(1, max_retries_per_model + 1):
             try:
                 logger.info(
@@ -60,33 +70,34 @@ Calculate the exact settings to dial in to match this record as closely as possi
                 )
                 return _execute_generation(model_name, prompt)
 
-            except APIError as e:
-                last_error = e
-                # Intercept temporary errors
-                if e.code in (503, 429) or "high demand" in str(e).lower():
+            except errors.APIError as exc:
+                last_error = exc
+                # Intercept temporary rate-limiting or high-demand errors
+                is_rate_limit = exc.code in (429, 503) or "high demand" in str(exc).lower()
+                if is_rate_limit:
                     if attempt < max_retries_per_model:
-                        sleep_time = (1.5**attempt) + random.uniform(0.1, 0.6)
+                        backoff = (1.5**attempt) + random.uniform(0.1, 0.5)
                         logger.warning(
-                            f"Model {model_name} returned {e.code}. Retrying in {sleep_time:.2f} seconds..."
+                            f"Model {model_name} returned {exc.code}. Retrying in {backoff:.2f}s..."
                         )
-                        time.sleep(sleep_time)
+                        time.sleep(backoff)
                         continue
-                    else:
-                        logger.warning(
-                            f"Model {model_name} returned {e.code} after {max_retries_per_model} attempts. All attempts exhausted. Trying next candidate model..."
-                        )
-                        break
+                    logger.warning(
+                        f"Model {model_name} exhausted all {max_retries_per_model} attempts. Trying next model..."
+                    )
+                    break
 
-                raise e # if error is not temporary or max retries reached
-
-            except Exception as e:
-                last_error = e
-                logger.error(
-                    f"Unexpected error with {model_name} on attempt {attempt}: {str(e)}"
-                )
-                if attempt < max_retries_per_model:
-                    time.sleep(1.0)
-                    continue
+                logger.error(f"Permanent API Error with {model_name}: {exc}")
                 break
 
-    raise RuntimeError(f"Failed to generate content after {max_retries_per_model} attempts. Last error: {str(last_error)}")
+            except Exception as exc:
+                last_error = exc
+                logger.error(
+                    f"Unexpected error with {model_name} on attempt {attempt}: {exc}"
+                )
+                break
+
+    model_chain_str = ", ".join(candidate_models)
+    raise RuntimeError(
+        f"All models in the chain ({model_chain_str}) failed. Last error: {last_error}"
+    )
